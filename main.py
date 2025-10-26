@@ -1,26 +1,57 @@
 import os
+import numpy as np
 from dotenv import load_dotenv
 import time
 from typing import Dict, List
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from fastapi import HTTPException
+from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.chains import create_retrieval_chain, create_history_aware_retriever
+from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains import create_history_aware_retriever
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_astradb import AstraDBVectorStore
+from embedded_questions import embedded_questions
 
-# ==========================
-# INITIAL SETUP
-# ==========================
+# Functions Below
+
+def get_top_relevant_questions(ai_response, embedded_questions, embedding_model, top_k=3):
+    """
+    Converts the ai_response into an embedding, compares it with all embedded_questions,
+    and returns the top K most relevant questions (default: 3).
+    """
+    # Get embedding for AI response
+    response_embedding = embedding_model.embed_query(ai_response)
+
+    # Compute cosine similarity between response and each stored question
+    similarities = []
+    for item in embedded_questions:
+        question_embedding = np.array(item["embedding"])
+        similarity = np.dot(response_embedding, question_embedding) / (
+            np.linalg.norm(response_embedding) * np.linalg.norm(question_embedding)
+        )
+        similarities.append((item["question"], similarity))
+
+    # Sort by similarity score (descending)
+    similarities.sort(key=lambda x: x[1], reverse=True)
+
+    # Return top K question texts
+    top_questions = [q for q, _ in similarities[:top_k]]
+
+    return top_questions
+
+# Functions Above
+
 load_dotenv()
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # allow all for now
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -37,22 +68,21 @@ llm = ChatOpenAI(
     api_key=os.environ["OPENAI_API_KEY"]
 )
 
-# Load your Astra Vector DB
+# Reload vector DB (no re-embedding, fast)
 vector_store = AstraDBVectorStore(
-    collection_name="Madvisions_Data",
-    embedding=embedding_model,
-    api_endpoint=os.environ["ASTRA_DB_API_ENDPOINT"],
-    token=os.environ["ASTRA_DB_APPLICATION_TOKEN"],
-    namespace=None
+        collection_name="Madvisions_Data",       
+        embedding=embedding_model,
+        api_endpoint=os.environ["ASTRA_DB_API_ENDPOINT"],       
+        token=os.environ["ASTRA_DB_APPLICATION_TOKEN"],           
+        namespace=None         
 )
 
-# ==========================
-# PROMPTS AND CHAINS
-# ==========================
 contextualize_system_prompt = (
-    "Given a chat history and the latest user question which might reference context in the chat history, "
-    "formulate a standalone question which can be understood without the chat history. "
-    "Do NOT answer the question, just reformulate it if needed and otherwise return it as is."
+    "Given a chat history and the latest user question "
+    "which might reference context in the chat history, "
+    "formulate a standalone question which can be understood "
+    "without the chat history. Do NOT answer the question, "
+    "just reformulate it if needed and otherwise return it as is."
 )
 
 system_prompt = """
@@ -86,32 +116,28 @@ history_aware_retriever = create_history_aware_retriever(
 )
 document_chain = create_stuff_documents_chain(llm, prompt)
 rag_chain = create_retrieval_chain(
-    history_aware_retriever,
+    history_aware_retriever, 
     document_chain
 )
 
 chat_histories: Dict[str, List] = {}
 session_timestamps = {}
 
-# ==========================
-# MODELS
-# ==========================
+# Routes
+
 class UserInput(BaseModel):
     user_input: str
     session_id: str
 
-
-# ==========================
-# MAIN ENDPOINT
-# ==========================
 @app.post("/ai-answer")
 def generate_answer(request: UserInput):
-    # Cleanup old sessions
+
+    # Clean expired sessions (10 min)
     for sid in list(session_timestamps.keys()):
         if time.time() - session_timestamps[sid] > 600:
             chat_histories.pop(sid, None)
             session_timestamps.pop(sid, None)
-
+    
     session_id = request.session_id
 
     if session_id not in chat_histories:
@@ -120,45 +146,39 @@ def generate_answer(request: UserInput):
     session_timestamps[session_id] = time.time()
 
     try:
-        # STEP 1: Normal RAG response
+        # Get RAG-based AI answer
         response = rag_chain.invoke({
             "chat_history": chat_histories[session_id],
             "input": request.user_input,
         })
 
-        # Store in chat history
+        ai_answer = response["answer"]
+
+        # Add conversation to chat history
         chat_histories[session_id].extend([
             HumanMessage(content=request.user_input),
-            AIMessage(content=response["answer"])
+            AIMessage(content=ai_answer)
         ])
 
-        # 🆕 STEP 2: Prepare context text for the follow-up LLM
-        context_docs = response.get("context", [])
-        context_texts = [doc.page_content for doc in context_docs]
-        combined_context = "\n\n".join(context_texts) if context_texts else "No relevant context found."
+        # Get top 3 relevant questions
+        top_questions = get_top_relevant_questions(
+            ai_response=ai_answer,
+            embedded_questions=embedded_questions,
+            embedding_model=embedding_model,
+            top_k=3
+        )
 
-        # 🆕 STEP 3: Second lightweight LLM call to generate follow-ups
-        followup_prompt = f"""
-        You are an assistant that generates relevant, short, and natural follow-up questions.
-        Use only the information from the context below to ensure the questions are grounded in real data.
-
-        Context:
-        {combined_context}
-
-        Last AI Answer:
-        {response["answer"]}
-
-        Generate 3 short follow-up questions that a user might naturally ask next. 
-        Format them as a simple numbered list, without any extra text.
-        """
-
-        followup_response = llm.invoke(followup_prompt)  # 🆕 Second LLM call
-
-        # 🆕 STEP 4: Return both main answer and grounded follow-ups
         return {
-            "answer": response["answer"],
-            "followups": followup_response.content
+            "answer": ai_answer,
+            "related_questions": top_questions
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Below is just for testing and running server locally (remove below when uploading it on a cloud)
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
